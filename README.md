@@ -35,6 +35,18 @@ Alle Inhalte liegen in [`data-sources/`](./data-sources/):
 | [`10-internationale-quellen.md`](./data-sources/10-internationale-quellen.md) | Eurostat, OECD, IWF, Weltbank, EZB (SDW) |
 | [`11-apis-und-tools.md`](./data-sources/11-apis-und-tools.md) | GENESIS-API, Bundesbank-SDMX, Dashboard-Deutschland-API, bundesAPI |
 
+## Anbindung / Warehouse
+
+Neben der thematischen Quellenübersicht in `data-sources/` gibt es eine
+**quellenzentrierte Anbindungs-Ebene**:
+
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — Zielarchitektur: ein
+  **DuckDB-Warehouse** (raw → staging → mart) für die wichtigsten Indikatoren.
+- [`sources/`](./sources/) — je Datenquelle ein Ordner mit enthaltenen Daten,
+  Zugriffsweg und konkretem DuckDB-Anbindungsplan.
+
+Die Umsetzung wird über GitHub-Issues (ein Issue je Quelle) gesteuert.
+
 ## Prinzipien
 
 - **Primärquellen zuerst** — amtliche Statistik (Destatis, Bundesbank, BA)
