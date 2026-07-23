@@ -8,8 +8,12 @@ dieses Dokument, damit die Details nicht je Quelle wiederholt werden.
 
 Ein schlankes, dateibasiertes **DuckDB-Warehouse**, das die wichtigsten
 Indikatoren zur deutschen Wirtschaft aus heterogenen Quellen (REST-APIs,
-SDMX, XLSX-Downloads) einsammelt, harmonisiert und analysebereit bereitstellt —
-ohne Server, versionierbar im Repo, per GitHub Actions aktualisiert.
+SDMX, XLSX-Downloads) einsammelt, harmonisiert und analysebereit bereitstellt.
+Der Build läuft per GitHub Actions; die fertige DuckDB-Datei wird auf einen VPS
+ausgeliefert und dort von einer API gelesen. Deployment/Serving sind in
+[`docs/adr/0004-vps-deployment-und-github-actions-etl.md`](./docs/adr/0004-vps-deployment-und-github-actions-etl.md)
+festgelegt — dieses Dokument beschreibt den **Datenteil** (Extract → Warehouse),
+das ADR den **Betriebsteil**.
 
 ```
                 Extract (Python)              Load/Transform (DuckDB + SQL)
@@ -18,7 +22,9 @@ ohne Server, versionierbar im Repo, per GitHub Actions aktualisiert.
    Datei)                               asof-versioniert)                      ├─ stg_*      (typisiert, harmonisiert)
                                                                               └─ mart_*     (analysebereit, quellenuebergreifend)
                                                                                      │
-                                                                                     └─► Export parquet (für App/Sharing)
+                                     Deploy (GitHub Actions, siehe ADR-0004)         │
+                                     ├─► parquet-Export ─► Cloudflare R2 (Archiv)  ◄─┤
+                                     └─► warehouse.duckdb ─► rsync/SSH auf VPS ─► Symlink-Swap + API-Reload
 ```
 
 ## Schichten (Layer)
@@ -67,8 +73,11 @@ je `indicator_id`.
   (`read_*_auto`) in `raw_*`, fuehrt dann die SQL-Modelle in Reihenfolge aus:
   `sql/staging/*.sql` → `sql/marts/*.sql`.
 - SQL-Dateien sind idempotent (`CREATE OR REPLACE TABLE …`).
-- Am Ende: Export der Marts nach `data/marts/*.parquet` (klein, versionierbar,
-  direkt von einer App lesbar — analog zum Ladeinfrastruktur-Repo).
+- Am Ende steht die fertige `warehouse.duckdb`. Zusätzlich werden die Marts nach
+  `data/marts/*.parquet` exportiert — diese Parquet-Snapshots dienen als
+  **portables Archiv** und werden nach Cloudflare R2 geladen (siehe ADR-0004),
+  nicht ins Repo committet. Die DuckDB-Datei ist das **ausgelieferte Artefakt**
+  (rsync auf den VPS), gelesen von der FastAPI-API.
 
 ## Revisionen & Idempotenz
 
@@ -78,14 +87,34 @@ je `indicator_id`.
 - Re-Runs sind gefahrlos: gleiche `asof` ueberschreibt die Rohdatei, `CREATE OR
   REPLACE` baut die Modelle neu.
 
-## Orchestrierung (GitHub Actions)
+## Orchestrierung & Deployment (GitHub Actions, ADR-0004)
+
+Verbindliche Referenz: [ADR-0004](./docs/adr/0004-vps-deployment-und-github-actions-etl.md).
+Kein eigener Scheduler — GitHub Actions ist Build **und** Deploy.
 
 - Ein Workflow je Update-Rhythmus (monatlich fuer die meisten Reihen;
-  quartals-/jaehrlich fuer VGR/Fiskaldaten), analog zu den vorhandenen
-  Workflows im Ladeinfrastruktur-Repo.
-- Der Workflow: `uv sync` → `python pipeline/run.py --source <name>` →
-  Marts committen (`data/marts/*.parquet`) → optional Redeploy-Stamp.
-- Secrets (z. B. Destatis-/BA-Zugangsdaten) als GitHub Actions Secrets.
+  quartals-/jaehrlich fuer VGR/Fiskaldaten).
+- Ablauf je Lauf:
+  1. `uv sync`
+  2. `python pipeline/run.py --source <name>` → baut `warehouse.duckdb`
+  3. **Qualitaetspruefungen** (vgl. ADR-0002) — Lauf bricht bei Verletzung ab
+  4. Parquet-Export → **Cloudflare R2** (Archiv)
+  5. `rsync` der `warehouse.duckdb` per SSH auf den **Hetzner-VPS**
+  6. auf dem VPS: **Symlink-Wechsel** (atomarer Austausch) + **API-Reload**
+- **Serving:** FastAPI liest die DuckDB-Datei lokal vom VPS-Volume; Caddy
+  (TLS) + Cloudflare (CDN/Cache) davor; Frontend (Next.js) auf Cloudflare Pages.
+- **Secrets** als GitHub Actions Secrets: Quell-Zugaenge (`DESTATIS_*`, `BA_*`),
+  `SSH_DEPLOY_KEY` (auf Zielverzeichnis beschraenkt, rotiert), R2-Credentials.
+
+## Monitoring (verbindlich, ADR-0004)
+
+- `/health` der API liefert `data_version`, letzten erfolgreichen Lauf **je
+  Quelle** und den DB-Verbindungsstatus.
+- Externer Uptime-Monitor prueft `/health` und alarmiert, wenn eine Quelle ihr
+  erwartetes Aktualisierungsintervall um > 100 % ueberschreitet
+  (**Freshness-Alarm** gegen still fehlschlagende Importer).
+- Deshalb fuehrt jede `stg_*`/`mart_*` den `asof`/letzten Stand je Quelle mit,
+  damit `/health` die Frische je Quelle berechnen kann.
 
 ## Konventionen (aus `CLAUDE.md`)
 
@@ -107,11 +136,16 @@ sql/
 ├── staging/           # stg_*.sql
 └── marts/             # mart_*.sql, dim_*.sql
 data/
-├── raw/               # Landing (asof-versioniert) — ggf. gitignored
-└── marts/             # exportierte parquet-Marts (versioniert)
-warehouse.duckdb       # lokales Warehouse (gitignored)
+├── raw/               # Landing (asof-versioniert) — gitignored
+└── marts/             # exportierte parquet-Marts → Cloudflare R2 (gitignored)
+warehouse.duckdb       # gebautes Warehouse, Deploy-Artefakt → VPS (gitignored)
+deploy/                # Docker Compose, Caddyfile, FastAPI-App (siehe ADR-0004)
+docs/adr/              # Architektur-Entscheidungen (ADR-0004: Deployment)
 sources/               # Doku je Quelle (dieses Repo)
 ```
+
+> `data/raw/`, `data/marts/` und `warehouse.duckdb` liegen in `.gitignore` — die
+> Auslieferung erfolgt ueber R2 bzw. rsync (ADR-0004), nicht ueber das Repo.
 
 ## Priorisierung der Anbindung (Kern-Set)
 
